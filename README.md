@@ -16,4 +16,7 @@ npx hardhat run scripts/deploy.js --network ropsten
 ```
 
 Deployment
-npx hardhat run scripts/deploy --network<network>
+
+```shell
+npx hardhat run scripts/deploy.js --network<network>
+```
