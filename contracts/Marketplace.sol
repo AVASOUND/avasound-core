@@ -1,8 +1,9 @@
-//SPDX-License-Identifier: Unlicense
 pragma solidity ^0.8.0;
 
+// SPDX-License-Identifier: MIT
+
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "../interfaces/IERC2981.sol";
+import "./IERC2981.sol";
 import "./Token.sol";
 
 /**
@@ -114,11 +115,11 @@ contract Marketplace {
 
     /// @notice Purchases a token and transfers royalties if applicable
     /// @param tokenId - id of the token to sell
-    function purchase(uint256 tokenId)
-        external
-        payable
-        tokenOwnerForbidden(tokenId)
-    {
+    function purchase(
+        uint256 tokenId,
+        bytes memory data,
+        uint256 amount
+    ) external payable tokenOwnerForbidden(tokenId) {
         address seller = activeSellOffers[tokenId].seller;
 
         require(seller != address(0), "No active sell offer");
@@ -146,7 +147,7 @@ contract Marketplace {
         // Transfer funds to the seller
         activeSellOffers[tokenId].seller.call{value: saleValue}("");
         // And token to the buyer
-        token.safeTransferFrom(seller, msg.sender, tokenId);
+        token.safeTransferFrom(seller, msg.sender, tokenId, amount, data);
         // Remove all sell and buy offers
         delete (activeSellOffers[tokenId]);
         delete (activeBuyOffers[tokenId]);
@@ -226,11 +227,11 @@ contract Marketplace {
     /// @notice Lets a token owner accept the current buy offer
     ///         (even without a sell offer)
     /// @param tokenId - id of the token whose buy order to accept
-    function acceptBuyOffer(uint256 tokenId)
-        external
-        isMarketable(tokenId)
-        tokenOwnerOnly(tokenId)
-    {
+    function acceptBuyOffer(
+        uint256 tokenId,
+        bytes memory data,
+        uint256 amount
+    ) external isMarketable(tokenId) tokenOwnerOnly(tokenId) {
         address currentBuyer = activeBuyOffers[tokenId].buyer;
         require(currentBuyer != address(0), "No buy offer");
         uint256 saleValue = activeBuyOffers[tokenId].price;
@@ -248,7 +249,7 @@ contract Marketplace {
         // Transfer funds to the seller
         msg.sender.call{value: netSaleValue}("");
         // And token to the buyer
-        token.safeTransferFrom(msg.sender, currentBuyer, tokenId);
+        token.safeTransferFrom(msg.sender, currentBuyer, tokenId, amount, data);
         // Broadcast the sale
         emit Sale(tokenId, msg.sender, currentBuyer, saleValue);
     }
