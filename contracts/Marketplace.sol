@@ -1,281 +1,112 @@
+// SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
-// SPDX-License-Identifier: MIT
-
+import "@openzeppelin/contracts/utils/Counters.sol";
+import "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "./IERC2981.sol";
-import "./Token.sol";
 
-/**
- * @title NFT Marketplace with ERC-2981 support
- * @notice Defines a marketplace to bid on and sell NFTs.
- *         Sends royalties to rightsholder on each sale if applicable.
+/*
+ * Smart contract allowing users to trade (list and buy) NTFs from any ERC1155 smart contract.
  */
-contract Marketplace {
-    struct SellOffer {
+
+contract Marketplace is Ownable, ReentrancyGuard{
+    
+    using Counters for Counters.Counter;
+    Counters.Counter private _listingIds;
+    Counters.Counter private _tokensSold;
+    uint256 private _volume;
+
+    event TokenListed(address contractAddress, address seller, uint256 tokenId, uint256 amount, uint256 pricePerToken);
+    event TokenSold(address contractAddress, address seller, address buyer, uint256 tokenId, uint256 amount, uint256 pricePerToken);
+
+    mapping(uint256 => Listing) private idToListing;
+
+    struct Listing {
+        address contractAddress;
         address seller;
-        uint256 minPrice;
-    }
-
-    struct BuyOffer {
-        address buyer;
+        uint256 tokenId;
+        uint256 amount;
         uint256 price;
-        uint256 createTime;
+        uint256 tokensAvailable;
+        bool completed;
     }
 
-    bytes4 private constant _INTERFACE_ID_ERC2981 = 0x2a55205a;
-    // Store the address of the contract of the NFT to trade. Can be changed in
-    // constructor or with a call to setTokenContractAddress.
-    address public _tokenContractAddress = address(0);
-    // Store all active sell offers  and maps them to their respective token ids
-    mapping(uint256 => SellOffer) public activeSellOffers;
-    // Store all active buy offers and maps them to their respective token ids
-    mapping(uint256 => BuyOffer) public activeBuyOffers;
-    // Token contract
-    Token token;
-    // Escrow for buy offers
-    mapping(address => mapping(uint256 => uint256)) public buyOffersEscrow;
-
-    // Events
-    event NewSellOffer(uint256 tokenId, address seller, uint256 value);
-    event NewBuyOffer(uint256 tokenId, address buyer, uint256 value);
-    event SellOfferWithdrawn(uint256 tokenId, address seller);
-    event BuyOfferWithdrawn(uint256 tokenId, address buyer);
-    event RoyaltiesPaid(uint256 tokenId, uint256 value);
-    event Sale(uint256 tokenId, address seller, address buyer, uint256 value);
-
-    constructor(address tokenContractAddress) {
-        _tokenContractAddress = tokenContractAddress;
-        token = Token(_tokenContractAddress);
+    struct Stats {
+        uint256 volume;
+        uint256 itemsSold;
     }
 
-    /// @notice Checks if NFT contract implements the ERC-2981 interface
-    /// @param _contract - the address of the NFT contract to query
-    /// @return true if ERC-2981 interface is supported, false otherwise
-    function _checkRoyalties(address _contract) internal returns (bool) {
-        bool success = IERC2981(_contract).supportsInterface(
-            _INTERFACE_ID_ERC2981
+    function listToken(address contractAddress, uint256 tokenId, uint256 amount, uint256 price) public nonReentrant {
+        ERC1155 token = ERC1155(contractAddress);
+
+        require(token.balanceOf(msg.sender, tokenId) > amount, "Caller must own given token!");
+        require(token.isApprovedForAll(msg.sender, address(this)), "Contract must be approved!");
+
+        _listingIds.increment();
+        uint256 listingId = _listingIds.current();
+        idToListing[listingId] = Listing(contractAddress, msg.sender, tokenId, amount, price, amount, false);
+
+        emit TokenListed(contractAddress, msg.sender, tokenId, amount, price);
+    }
+
+    function purchaseToken(uint256 listingId, uint256 amount) public payable nonReentrant {
+        ERC1155 token = ERC1155(idToListing[listingId].contractAddress);
+
+        require(msg.sender != idToListing[listingId].seller, "Can't buy your onw tokens!");
+        require(msg.value >= idToListing[listingId].price * amount, "Insufficient funds!");
+        require(token.balanceOf(idToListing[listingId].seller, idToListing[listingId].tokenId) >= amount, "Seller doesn't have enough tokens!");
+        require(idToListing[listingId].completed == false, "Listing not available anymore!");
+        require(idToListing[listingId].tokensAvailable >= amount, "Not enough tokens left!");
+        
+        _tokensSold.increment();
+        _volume += idToListing[listingId].price * amount;
+
+        idToListing[listingId].tokensAvailable -= amount;
+        if(idToListing[listingId].tokensAvailable == 0) {
+            idToListing[listingId].completed = true;
+        }
+
+        emit TokenSold(
+            idToListing[listingId].contractAddress,
+            idToListing[listingId].seller,
+            msg.sender,
+            idToListing[listingId].tokenId,
+            amount,
+            idToListing[listingId].price
         );
-        return success;
+
+        token.safeTransferFrom(idToListing[listingId].seller, msg.sender, idToListing[listingId].tokenId, amount, "");
+        payable(idToListing[listingId].seller).transfer((idToListing[listingId].price * amount/50)*49); //Transfering 98% to seller, fee 2%  ((msg.value/50)*49)
     }
 
-    /// @notice Puts a token on sale at a given price
-    /// @param tokenId - id of the token to sell
-    /// @param minPrice - minimum price at which the token can be sold
-    function makeSellOffer(uint256 tokenId, uint256 minPrice)
-        external
-        isMarketable(tokenId)
-        tokenOwnerOnly(tokenId)
-    {
-        // Create sell offer
-        activeSellOffers[tokenId] = SellOffer({
-            seller: msg.sender,
-            minPrice: minPrice
-        });
-        // Broadcast sell offer
-        emit NewSellOffer(tokenId, msg.sender, minPrice);
-    }
+    function  viewAllListings() public view returns (Listing[] memory) {
+        uint itemCount = _listingIds.current();
+        uint unsoldItemCount = _listingIds.current() - _tokensSold.current();
+        uint currentIndex = 0;
 
-    /// @notice Withdraw a sell offer
-    /// @param tokenId - id of the token whose sell order needs to be cancelled
-    function withdrawSellOffer(uint256 tokenId) external isMarketable(tokenId) {
-        require(
-            activeSellOffers[tokenId].seller != address(0),
-            "No sale offer"
-        );
-        require(activeSellOffers[tokenId].seller == msg.sender, "Not seller");
-        // Removes the current sell offer
-        delete (activeSellOffers[tokenId]);
-        // Broadcast offer withdrawal
-        emit SellOfferWithdrawn(tokenId, msg.sender);
-    }
+        Listing[] memory items = new Listing[](unsoldItemCount);
 
-    /// @notice Transfers royalties to the rightsowner if applicable
-    /// @param tokenId - the NFT assed queried for royalties
-    /// @param grossSaleValue - the price at which the asset will be sold
-    /// @return netSaleAmount - the value that will go to the seller after
-    ///         deducting royalties
-    function _deduceRoyalties(uint256 tokenId, uint256 grossSaleValue)
-        internal
-        returns (uint256 netSaleAmount)
-    {
-        // Get amount of royalties to pays and recipient
-        (address royaltiesReceiver, uint256 royaltiesAmount) = token
-            .royaltyInfo(tokenId, grossSaleValue);
-        // Deduce royalties from sale value
-        uint256 netSaleValue = grossSaleValue - royaltiesAmount;
-        // Transfer royalties to rightholder if not zero
-        if (royaltiesAmount > 0) {
-            royaltiesReceiver.call{value: royaltiesAmount}("");
-        }
-        // Broadcast royalties payment
-        emit RoyaltiesPaid(tokenId, royaltiesAmount);
-        return netSaleValue;
-    }
-
-    /// @notice Purchases a token and transfers royalties if applicable
-    /// @param tokenId - id of the token to sell
-    function purchase(
-        uint256 tokenId,
-        bytes memory data,
-        uint256 amount
-    ) external payable tokenOwnerForbidden(tokenId) {
-        address seller = activeSellOffers[tokenId].seller;
-
-        require(seller != address(0), "No active sell offer");
-
-        // If, for some reason, the token is not approved anymore (transfer or
-        // sale on another market place for instance), we remove the sell order
-        // and throw
-        if (token.getApproved(tokenId) != address(this)) {
-            delete (activeSellOffers[tokenId]);
-            // Broadcast offer withdrawal
-            emit SellOfferWithdrawn(tokenId, seller);
-            // Revert
-            revert("Invalid sell offer");
+        for (uint i = 0; i < itemCount; i++) {
+                uint currentId = i + 1;
+                Listing storage currentItem = idToListing[currentId];
+                items[currentIndex] = currentItem;
+                currentIndex += 1;
         }
 
-        require(
-            msg.value >= activeSellOffers[tokenId].minPrice,
-            "Amount sent too low"
-        );
-        uint256 saleValue = msg.value;
-        // Pay royalties if applicable
-        if (_checkRoyalties(_tokenContractAddress)) {
-            saleValue = _deduceRoyalties(tokenId, saleValue);
-        }
-        // Transfer funds to the seller
-        activeSellOffers[tokenId].seller.call{value: saleValue}("");
-        // And token to the buyer
-        token.safeTransferFrom(seller, msg.sender, tokenId, amount, data);
-        // Remove all sell and buy offers
-        delete (activeSellOffers[tokenId]);
-        delete (activeBuyOffers[tokenId]);
-        // Broadcast the sale
-        emit Sale(tokenId, seller, msg.sender, msg.value);
+        return items;
     }
 
-    /// @notice Makes a buy offer for a token. The token does not need to have
-    ///         been put up for sale. A buy offer can not be withdrawn or
-    ///         replaced for 24 hours. Amount of the offer is put in escrow
-    ///         until the offer is withdrawn or superceded
-    /// @param tokenId - id of the token to buy
-    function makeBuyOffer(uint256 tokenId)
-        external
-        payable
-        tokenOwnerForbidden(tokenId)
-    {
-        // Reject the offer if item is already available for purchase at a
-        // lower or identical price
-        if (activeSellOffers[tokenId].minPrice != 0) {
-            require(
-                (msg.value > activeSellOffers[tokenId].minPrice),
-                "Sell order at this price or lower exists"
-            );
-        }
-        // Only process the offer if it is higher than the previous one or the
-        // previous one has expired
-        require(
-            activeBuyOffers[tokenId].createTime < (block.timestamp - 1 days) ||
-                msg.value > activeBuyOffers[tokenId].price,
-            "Previous buy offer higher or not expired"
-        );
-        address previousBuyOfferOwner = activeBuyOffers[tokenId].buyer;
-        uint256 refundBuyOfferAmount = buyOffersEscrow[previousBuyOfferOwner][
-            tokenId
-        ];
-        // Refund the owner of the previous buy offer
-        buyOffersEscrow[previousBuyOfferOwner][tokenId] = 0;
-        if (refundBuyOfferAmount > 0) {
-            payable(previousBuyOfferOwner).call{value: refundBuyOfferAmount}(
-                ""
-            );
-        }
-        // Create a new buy offer
-        activeBuyOffers[tokenId] = BuyOffer({
-            buyer: msg.sender,
-            price: msg.value,
-            createTime: block.timestamp
-        });
-        // Create record of funds deposited for this offer
-        buyOffersEscrow[msg.sender][tokenId] = msg.value;
-        // Broadcast the buy offer
-        emit NewBuyOffer(tokenId, msg.sender, msg.value);
+    function viewListingById(uint256 _id) public view returns(Listing memory) {
+        return idToListing[_id];
     }
 
-    /// @notice Withdraws a buy offer. Can only be withdrawn a day after being
-    ///         posted
-    /// @param tokenId - id of the token whose buy order to remove
-    function withdrawBuyOffer(uint256 tokenId)
-        external
-        lastBuyOfferExpired(tokenId)
-    {
-        require(activeBuyOffers[tokenId].buyer == msg.sender, "Not buyer");
-        uint256 refundBuyOfferAmount = buyOffersEscrow[msg.sender][tokenId];
-        // Set the buyer balance to 0 before refund
-        buyOffersEscrow[msg.sender][tokenId] = 0;
-        // Remove the current buy offer
-        delete (activeBuyOffers[tokenId]);
-        // Refund the current buy offer if it is non-zero
-        if (refundBuyOfferAmount > 0) {
-            msg.sender.call{value: refundBuyOfferAmount}("");
-        }
-        // Broadcast offer withdrawal
-        emit BuyOfferWithdrawn(tokenId, msg.sender);
+    function viewStats() public view returns(Stats memory) {
+        return Stats(_volume, _tokensSold.current());
     }
 
-    /// @notice Lets a token owner accept the current buy offer
-    ///         (even without a sell offer)
-    /// @param tokenId - id of the token whose buy order to accept
-    function acceptBuyOffer(
-        uint256 tokenId,
-        bytes memory data,
-        uint256 amount
-    ) external isMarketable(tokenId) tokenOwnerOnly(tokenId) {
-        address currentBuyer = activeBuyOffers[tokenId].buyer;
-        require(currentBuyer != address(0), "No buy offer");
-        uint256 saleValue = activeBuyOffers[tokenId].price;
-        uint256 netSaleValue = saleValue;
-        // Pay royalties if applicable
-        if (_checkRoyalties(_tokenContractAddress)) {
-            netSaleValue = _deduceRoyalties(tokenId, saleValue);
-        }
-        // Delete the current sell offer whether it exists or not
-        delete (activeSellOffers[tokenId]);
-        // Delete the buy offer that was accepted
-        delete (activeBuyOffers[tokenId]);
-        // Withdraw buyer's balance
-        buyOffersEscrow[currentBuyer][tokenId] = 0;
-        // Transfer funds to the seller
-        msg.sender.call{value: netSaleValue}("");
-        // And token to the buyer
-        token.safeTransferFrom(msg.sender, currentBuyer, tokenId, amount, data);
-        // Broadcast the sale
-        emit Sale(tokenId, msg.sender, currentBuyer, saleValue);
+    function withdrawFees() public onlyOwner nonReentrant {
+        payable(msg.sender).transfer(address(this).balance);
     }
 
-    modifier isMarketable(uint256 tokenId) {
-        require(token.getApproved(tokenId) == address(this), "Not approved");
-        _;
-    }
-    modifier tokenOwnerForbidden(uint256 tokenId) {
-        require(
-            token.ownerOf(tokenId) != msg.sender,
-            "Token owner not allowed"
-        );
-        _;
-    }
-
-    modifier tokenOwnerOnly(uint256 tokenId) {
-        require(token.ownerOf(tokenId) == msg.sender, "Not token owner");
-        _;
-    }
-
-    modifier lastBuyOfferExpired(uint256 tokenId) {
-        require(
-            activeBuyOffers[tokenId].createTime < (block.timestamp - 1 days),
-            "Buy offer not expired"
-        );
-        _;
-    }
 }
